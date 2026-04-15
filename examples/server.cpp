@@ -78,6 +78,193 @@ bool IsClientDisconnect(const std::exception& e) {
   return std::string(e.what()) == "peer closed socket while receiving data";
 }
 
+struct TopicSubscription {
+  std::string topic_filter;
+  std::uint8_t qos = 0;
+};
+
+struct ClientSession {
+  int fd = -1;
+  std::string device_id;
+  std::mutex write_mutex;
+  std::vector<TopicSubscription> subscriptions;
+};
+
+std::vector<std::string> SplitTopicLevels(const std::string& value) {
+  std::vector<std::string> levels;
+  std::size_t start = 0;
+  while (start <= value.size()) {
+    const std::size_t slash = value.find('/', start);
+    if (slash == std::string::npos) {
+      levels.push_back(value.substr(start));
+      break;
+    }
+    levels.push_back(value.substr(start, slash - start));
+    start = slash + 1;
+  }
+  return levels;
+}
+
+bool TopicFilterMatches(const std::string& topic_filter, const std::string& topic) {
+  const std::vector<std::string> filter_levels = SplitTopicLevels(topic_filter);
+  const std::vector<std::string> topic_levels = SplitTopicLevels(topic);
+
+  std::size_t fi = 0;
+  std::size_t ti = 0;
+  while (fi < filter_levels.size() && ti < topic_levels.size()) {
+    const std::string& f = filter_levels[fi];
+    if (f == "#") {
+      return fi + 1 == filter_levels.size();
+    }
+    if (f != "+" && f != topic_levels[ti]) {
+      return false;
+    }
+    ++fi;
+    ++ti;
+  }
+
+  if (fi == filter_levels.size() && ti == topic_levels.size()) {
+    return true;
+  }
+  if (fi + 1 == filter_levels.size() && filter_levels[fi] == "#") {
+    return true;
+  }
+  return false;
+}
+
+bool SendFrameToSession(const std::shared_ptr<ClientSession>& session, const cstp::Frame& frame,
+                        const char* context) {
+  std::lock_guard<std::mutex> lock(session->write_mutex);
+  try {
+    cstp::SendFrame(session->fd, frame);
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << context << " send failed for device_id=" << session->device_id
+              << " fd=" << session->fd << ": " << e.what() << "\n";
+    return false;
+  }
+}
+
+class BrokerState {
+ public:
+  explicit BrokerState(std::atomic<std::uint32_t>* next_message_id)
+      : next_message_id_(next_message_id) {}
+
+  void AddSession(const std::shared_ptr<ClientSession>& session) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    sessions_[session->fd] = session;
+  }
+
+  void RemoveSession(int fd) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    sessions_.erase(fd);
+  }
+
+  std::uint8_t Subscribe(int fd, const std::string& topic_filter, std::uint8_t requested_qos) {
+    const std::uint8_t granted_qos = requested_qos > 1 ? 1 : requested_qos;
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = sessions_.find(fd);
+    if (it == sessions_.end()) {
+      return granted_qos;
+    }
+    const std::shared_ptr<ClientSession> session = it->second.lock();
+    if (!session) {
+      sessions_.erase(it);
+      return granted_qos;
+    }
+
+    for (auto& sub : session->subscriptions) {
+      if (sub.topic_filter == topic_filter) {
+        sub.qos = granted_qos;
+        return granted_qos;
+      }
+    }
+    session->subscriptions.push_back(TopicSubscription{
+        .topic_filter = topic_filter,
+        .qos = granted_qos,
+    });
+    return granted_qos;
+  }
+
+  void Unsubscribe(int fd, const std::string& topic_filter) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = sessions_.find(fd);
+    if (it == sessions_.end()) {
+      return;
+    }
+    const std::shared_ptr<ClientSession> session = it->second.lock();
+    if (!session) {
+      sessions_.erase(it);
+      return;
+    }
+
+    auto& subs = session->subscriptions;
+    subs.erase(std::remove_if(subs.begin(), subs.end(),
+                              [&topic_filter](const TopicSubscription& sub) {
+                                return sub.topic_filter == topic_filter;
+                              }),
+               subs.end());
+  }
+
+  std::size_t Publish(const cstp::PublishPayload& payload) {
+    struct Delivery {
+      std::shared_ptr<ClientSession> session;
+      std::uint8_t granted_qos = 0;
+    };
+
+    std::vector<Delivery> deliveries;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      for (auto it = sessions_.begin(); it != sessions_.end();) {
+        const std::shared_ptr<ClientSession> session = it->second.lock();
+        if (!session) {
+          it = sessions_.erase(it);
+          continue;
+        }
+
+        std::uint8_t max_granted_qos = 0;
+        bool matched = false;
+        for (const auto& sub : session->subscriptions) {
+          if (TopicFilterMatches(sub.topic_filter, payload.topic)) {
+            matched = true;
+            if (sub.qos > max_granted_qos) {
+              max_granted_qos = sub.qos;
+            }
+          }
+        }
+        if (matched) {
+          deliveries.push_back(Delivery{
+              .session = session,
+              .granted_qos = max_granted_qos,
+          });
+        }
+        ++it;
+      }
+    }
+
+    for (const auto& delivery : deliveries) {
+      cstp::PublishPayload outbound = payload;
+      outbound.qos = std::min<std::uint8_t>(payload.qos, delivery.granted_qos);
+
+      cstp::Frame frame;
+      frame.header.type = cstp::MessageType::kPublish;
+      frame.header.flags = outbound.qos > 0 ? cstp::FrameFlags::kAckRequired : cstp::FrameFlags::kNone;
+      frame.header.message_id = next_message_id_->fetch_add(1, std::memory_order_relaxed);
+      frame.header.stream_id = cstp::StreamId::kData;
+      frame.header.timestamp_ms = cstp::UnixMillisNow();
+      frame.payload = cstp::EncodePublishPayload(outbound);
+      (void)SendFrameToSession(delivery.session, frame, "PUBLISH");
+    }
+
+    return deliveries.size();
+  }
+
+ private:
+  std::mutex mutex_;
+  std::unordered_map<int, std::weak_ptr<ClientSession>> sessions_;
+  std::atomic<std::uint32_t>* next_message_id_ = nullptr;
+};
+
 GpioMode ResolveGpioMode() {
   const char* env = std::getenv("CSTP_GPIO_MODE");
   if (env != nullptr) {
@@ -959,7 +1146,8 @@ void LogFrameSummary(const cstp::Frame& frame) {
 
 void HandleClient(int client_fd, GpioMode gpio_mode, int default_led_pin,
                   PwmBackend pwm_backend, EndpointRegistry* endpoint_registry,
-                  SoftPwmManager* soft_pwm, ServoSweepManager* servo_sweep) {
+                  SoftPwmManager* soft_pwm, ServoSweepManager* servo_sweep,
+                  BrokerState* broker_state, std::mutex* command_state_mutex) {
   const cstp::Frame hello_frame = cstp::ReceiveFrame(client_fd);
   if (hello_frame.header.type != cstp::MessageType::kHello) {
     throw cstp::ProtocolError("expected HELLO as first message");
@@ -968,6 +1156,20 @@ void HandleClient(int client_fd, GpioMode gpio_mode, int default_led_pin,
   const cstp::HelloPayload hello = cstp::DecodeHelloPayload(hello_frame.payload);
   std::cout << "HELLO from device_id=" << hello.device_id
             << " client_version=" << hello.client_version_name << "\n";
+
+  auto session = std::make_shared<ClientSession>();
+  session->fd = client_fd;
+  session->device_id = hello.device_id;
+  broker_state->AddSession(session);
+  struct SessionCleanup {
+    BrokerState* broker = nullptr;
+    int fd = -1;
+    ~SessionCleanup() {
+      if (broker != nullptr && fd >= 0) {
+        broker->RemoveSession(fd);
+      }
+    }
+  } cleanup{.broker = broker_state, .fd = client_fd};
 
   cstp::HelloAckPayload ack;
   ack.accepted = true;
@@ -987,7 +1189,9 @@ void HandleClient(int client_fd, GpioMode gpio_mode, int default_led_pin,
   hello_ack_frame.header.timestamp_ms = cstp::UnixMillisNow();
   hello_ack_frame.payload = cstp::EncodeHelloAckPayload(ack);
 
-  cstp::SendFrame(client_fd, hello_ack_frame);
+  if (!SendFrameToSession(session, hello_ack_frame, "HELLO_ACK")) {
+    throw cstp::ProtocolError("failed to send HELLO_ACK");
+  }
   std::cout << "HELLO_ACK sent\n";
 
   for (;;) {
@@ -1015,7 +1219,7 @@ void HandleClient(int client_fd, GpioMode gpio_mode, int default_led_pin,
         ack_frame.header.stream_id = cstp::StreamId::kData;
         ack_frame.header.timestamp_ms = cstp::UnixMillisNow();
         ack_frame.payload = cstp::EncodeDataAckPayload(ack);
-        cstp::SendFrame(client_fd, ack_frame);
+        (void)SendFrameToSession(session, ack_frame, "DATA_ACK");
 
         std::cout << "DATA_ACK sent for msg_id=" << frame.header.message_id
                   << " batch_id=" << batch.batch_id << "\n";
@@ -1033,9 +1237,11 @@ void HandleClient(int client_fd, GpioMode gpio_mode, int default_led_pin,
         std::cout << "CMD_REQ command_id=" << request.command_id
                   << " command_name=" << request.command_name << "\n";
 
-        const CommandExecutionResult exec =
-            ExecuteCommand(request, hello.device_id, gpio_mode, pwm_backend, default_led_pin,
-                           endpoint_registry, soft_pwm, servo_sweep);
+        const CommandExecutionResult exec = [&]() -> CommandExecutionResult {
+          std::lock_guard<std::mutex> lock(*command_state_mutex);
+          return ExecuteCommand(request, hello.device_id, gpio_mode, pwm_backend, default_led_pin,
+                                endpoint_registry, soft_pwm, servo_sweep);
+        }();
 
         cstp::CommandResponsePayload response;
         response.command_id = request.command_id;
@@ -1050,10 +1256,88 @@ void HandleClient(int client_fd, GpioMode gpio_mode, int default_led_pin,
         response_frame.header.stream_id = cstp::StreamId::kControl;
         response_frame.header.timestamp_ms = cstp::UnixMillisNow();
         response_frame.payload = cstp::EncodeCommandResponsePayload(response);
-        cstp::SendFrame(client_fd, response_frame);
+        (void)SendFrameToSession(session, response_frame, "CMD_RESP");
 
         std::cout << "CMD_RESP sent command_id=" << response.command_id
                   << " status_code=" << response.status_code << "\n";
+        break;
+      }
+      case cstp::MessageType::kSubscribe: {
+        const cstp::SubscribePayload request = cstp::DecodeSubscribePayload(frame.payload);
+        const std::uint8_t granted_qos =
+            broker_state->Subscribe(client_fd, request.topic_filter, request.requested_qos);
+
+        cstp::SubscribeAckPayload response;
+        response.packet_id = request.packet_id;
+        response.granted_qos = granted_qos;
+        response.message = "ok";
+
+        cstp::Frame response_frame;
+        response_frame.header.type = cstp::MessageType::kSubAck;
+        response_frame.header.flags = cstp::FrameFlags::kIsAck;
+        response_frame.header.message_id = frame.header.message_id;
+        response_frame.header.stream_id = cstp::StreamId::kControl;
+        response_frame.header.timestamp_ms = cstp::UnixMillisNow();
+        response_frame.payload = cstp::EncodeSubscribeAckPayload(response);
+        (void)SendFrameToSession(session, response_frame, "SUB_ACK");
+
+        std::cout << "SUBSCRIBE packet_id=" << request.packet_id
+                  << " filter=" << request.topic_filter
+                  << " qos=" << static_cast<int>(granted_qos) << "\n";
+        break;
+      }
+      case cstp::MessageType::kUnsubscribe: {
+        const cstp::UnsubscribePayload request = cstp::DecodeUnsubscribePayload(frame.payload);
+        broker_state->Unsubscribe(client_fd, request.topic_filter);
+
+        cstp::UnsubscribeAckPayload response;
+        response.packet_id = request.packet_id;
+        response.message = "ok";
+
+        cstp::Frame response_frame;
+        response_frame.header.type = cstp::MessageType::kUnsubAck;
+        response_frame.header.flags = cstp::FrameFlags::kIsAck;
+        response_frame.header.message_id = frame.header.message_id;
+        response_frame.header.stream_id = cstp::StreamId::kControl;
+        response_frame.header.timestamp_ms = cstp::UnixMillisNow();
+        response_frame.payload = cstp::EncodeUnsubscribeAckPayload(response);
+        (void)SendFrameToSession(session, response_frame, "UNSUB_ACK");
+
+        std::cout << "UNSUBSCRIBE packet_id=" << request.packet_id
+                  << " filter=" << request.topic_filter << "\n";
+        break;
+      }
+      case cstp::MessageType::kPublish: {
+        const cstp::PublishPayload request = cstp::DecodePublishPayload(frame.payload);
+        const std::size_t deliveries = broker_state->Publish(request);
+        std::cout << "PUBLISH packet_id=" << request.packet_id
+                  << " topic=" << request.topic
+                  << " qos=" << static_cast<int>(request.qos)
+                  << " retained=" << (request.retain ? "true" : "false")
+                  << " deliveries=" << deliveries << "\n";
+
+        if (request.qos > 0) {
+          cstp::PublishAckPayload response;
+          response.packet_id = request.packet_id;
+          response.status_code = 200;
+          response.message = "ok";
+
+          cstp::Frame response_frame;
+          response_frame.header.type = cstp::MessageType::kPubAck;
+          response_frame.header.flags = cstp::FrameFlags::kIsAck;
+          response_frame.header.message_id = frame.header.message_id;
+          response_frame.header.stream_id = cstp::StreamId::kControl;
+          response_frame.header.timestamp_ms = cstp::UnixMillisNow();
+          response_frame.payload = cstp::EncodePublishAckPayload(response);
+          (void)SendFrameToSession(session, response_frame, "PUB_ACK");
+        }
+        break;
+      }
+      case cstp::MessageType::kPubAck: {
+        const cstp::PublishAckPayload response = cstp::DecodePublishAckPayload(frame.payload);
+        std::cout << "PUB_ACK packet_id=" << response.packet_id
+                  << " status_code=" << response.status_code
+                  << " message=" << response.message << "\n";
         break;
       }
       case cstp::MessageType::kCmdResp: {
@@ -1061,6 +1345,20 @@ void HandleClient(int client_fd, GpioMode gpio_mode, int default_led_pin,
             cstp::DecodeCommandResponsePayload(frame.payload);
         std::cout << "CMD_RESP command_id=" << response.command_id
                   << " status_code=" << response.status_code << "\n";
+        break;
+      }
+      case cstp::MessageType::kSubAck: {
+        const cstp::SubscribeAckPayload response = cstp::DecodeSubscribeAckPayload(frame.payload);
+        std::cout << "SUB_ACK packet_id=" << response.packet_id
+                  << " qos=" << static_cast<int>(response.granted_qos)
+                  << " message=" << response.message << "\n";
+        break;
+      }
+      case cstp::MessageType::kUnsubAck: {
+        const cstp::UnsubscribeAckPayload response =
+            cstp::DecodeUnsubscribeAckPayload(frame.payload);
+        std::cout << "UNSUB_ACK packet_id=" << response.packet_id
+                  << " message=" << response.message << "\n";
         break;
       }
       case cstp::MessageType::kError: {
@@ -1100,6 +1398,9 @@ int main(int argc, char** argv) {
       .min_pulse_us = 500,
       .max_pulse_us = 2500,
   };
+  std::mutex command_state_mutex;
+  std::atomic<std::uint32_t> next_broker_message_id{1'000'000};
+  BrokerState broker_state(&next_broker_message_id);
 
   int server_fd = socket(AF_INET, SOCK_STREAM, 0);
   if (server_fd < 0) {
@@ -1139,19 +1440,21 @@ int main(int argc, char** argv) {
       std::cerr << "accept() failed\n";
       continue;
     }
-    FdGuard client_guard(client_fd);
-
-    try {
-      std::cout << "client connected\n";
-      HandleClient(client_fd, gpio_mode, default_led_pin, pwm_backend, &endpoint_registry,
-                   &soft_pwm, &servo_sweep);
-    } catch (const std::exception& e) {
-      if (IsClientDisconnect(e)) {
-        std::cout << "client disconnected\n";
-      } else {
-        std::cerr << "protocol error: " << e.what() << "\n";
+    std::thread([client_fd, gpio_mode, default_led_pin, pwm_backend, &endpoint_registry, &soft_pwm,
+                 &servo_sweep, &broker_state, &command_state_mutex]() {
+      FdGuard client_guard(client_fd);
+      try {
+        std::cout << "client connected\n";
+        HandleClient(client_fd, gpio_mode, default_led_pin, pwm_backend, &endpoint_registry,
+                     &soft_pwm, &servo_sweep, &broker_state, &command_state_mutex);
+      } catch (const std::exception& e) {
+        if (IsClientDisconnect(e)) {
+          std::cout << "client disconnected\n";
+        } else {
+          std::cerr << "protocol error: " << e.what() << "\n";
+        }
       }
-    }
+    }).detach();
   }
 
   return 0;

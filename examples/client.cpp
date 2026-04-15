@@ -1,6 +1,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -80,28 +81,88 @@ std::vector<std::uint8_t> EncodeBool(bool value) {
 }
 
 int main(int argc, char** argv) {
+  enum class ClientMode {
+    kDataBatch,
+    kCmd,
+    kPublish,
+    kSubscribe,
+  };
+
   const std::string host = (argc > 1) ? argv[1] : "127.0.0.1";
   const std::string port = (argc > 2) ? argv[2] : "18830";
-  const std::string command_mode = (argc > 3) ? argv[3] : "";
-  bool raw_cmd_mode = false;
+  const std::string mode_arg = (argc > 3) ? argv[3] : "";
+
+  ClientMode mode = ClientMode::kDataBatch;
   std::string raw_command_name;
   std::string raw_args_json;
+  std::string publish_topic;
+  std::string publish_text;
+  std::uint8_t publish_qos = 1;
+  bool publish_retain = false;
+  std::string subscribe_filter;
+  std::uint8_t subscribe_qos = 1;
 
-  if (!command_mode.empty()) {
-    if (command_mode != "cmd") {
-      std::cerr << "legacy command aliases removed. use raw mode:\n";
-      std::cerr
-          << "./build/cstp_client <host> <port> cmd <command_name> '<args_json>'\n";
+  auto ParseU8 = [](const std::string& value, const char* field_name) -> std::uint8_t {
+    try {
+      const int parsed = std::stoi(value);
+      if (parsed < 0 || parsed > 255) {
+        throw std::runtime_error("range");
+      }
+      return static_cast<std::uint8_t>(parsed);
+    } catch (...) {
+      throw cstp::ProtocolError(std::string("invalid ") + field_name + ": " + value);
+    }
+  };
+
+  if (!mode_arg.empty()) {
+    if (mode_arg == "cmd") {
+      if (argc <= 5) {
+        std::cerr
+            << "usage: ./build/cstp_client <host> <port> cmd <command_name> '<args_json>'\n";
+        return 1;
+      }
+      mode = ClientMode::kCmd;
+      raw_command_name = argv[4];
+      raw_args_json = argv[5];
+    } else if (mode_arg == "pub") {
+      if (argc <= 5) {
+        std::cerr
+            << "usage: ./build/cstp_client <host> <port> pub <topic> '<payload_text>' [qos 0|1] [retain 0|1]\n";
+        return 1;
+      }
+      mode = ClientMode::kPublish;
+      publish_topic = argv[4];
+      publish_text = argv[5];
+      if (argc > 6) {
+        publish_qos = ParseU8(argv[6], "qos");
+        if (publish_qos > 1) {
+          std::cerr << "qos > 1 not supported in this client/server yet\n";
+          return 1;
+        }
+      }
+      if (argc > 7) {
+        publish_retain = ParseU8(argv[7], "retain") != 0;
+      }
+    } else if (mode_arg == "sub") {
+      if (argc <= 4) {
+        std::cerr
+            << "usage: ./build/cstp_client <host> <port> sub <topic_filter> [qos 0|1]\n";
+        return 1;
+      }
+      mode = ClientMode::kSubscribe;
+      subscribe_filter = argv[4];
+      if (argc > 5) {
+        subscribe_qos = ParseU8(argv[5], "qos");
+        if (subscribe_qos > 1) {
+          std::cerr << "qos > 1 not supported in this client/server yet\n";
+          return 1;
+        }
+      }
+    } else {
+      std::cerr << "unknown mode: " << mode_arg << "\n";
+      std::cerr << "supported modes: cmd, pub, sub\n";
       return 1;
     }
-    if (argc <= 5) {
-      std::cerr
-          << "raw cmd mode usage: ./build/cstp_client <host> <port> cmd <command_name> '<args_json>'\n";
-      return 1;
-    }
-    raw_cmd_mode = true;
-    raw_command_name = argv[4];
-    raw_args_json = argv[5];
   }
 
   const int fd = ConnectTcp(host, port);
@@ -118,28 +179,29 @@ int main(int argc, char** argv) {
   hello.client_max_frame_bytes = static_cast<std::uint32_t>(cstp::kDefaultMaxFrameBytes);
   hello.client_version_name = "cstp-cpp/0.1";
 
-  cstp::Frame frame;
-  frame.header.type = cstp::MessageType::kHello;
-  frame.header.flags = cstp::FrameFlags::kAckRequired;
-  frame.header.message_id = 1;
-  frame.header.stream_id = cstp::StreamId::kControl;
-  frame.header.timestamp_ms = cstp::UnixMillisNow();
-  frame.payload = cstp::EncodeHelloPayload(hello);
+  std::uint32_t next_message_id = 1;
+  cstp::Frame hello_frame;
+  hello_frame.header.type = cstp::MessageType::kHello;
+  hello_frame.header.flags = cstp::FrameFlags::kAckRequired;
+  hello_frame.header.message_id = next_message_id++;
+  hello_frame.header.stream_id = cstp::StreamId::kControl;
+  hello_frame.header.timestamp_ms = cstp::UnixMillisNow();
+  hello_frame.payload = cstp::EncodeHelloPayload(hello);
 
   try {
-    cstp::SendFrame(fd, frame);
+    cstp::SendFrame(fd, hello_frame);
     std::cout << "HELLO sent\n";
 
-    const cstp::Frame response = cstp::ReceiveFrame(fd);
-    if (response.header.type != cstp::MessageType::kHelloAck) {
+    const cstp::Frame hello_response = cstp::ReceiveFrame(fd);
+    if (hello_response.header.type != cstp::MessageType::kHelloAck) {
       throw cstp::ProtocolError("expected HELLO_ACK in response");
     }
 
-    const cstp::HelloAckPayload ack = cstp::DecodeHelloAckPayload(response.payload);
+    const cstp::HelloAckPayload ack = cstp::DecodeHelloAckPayload(hello_response.payload);
     std::cout << "HELLO_ACK accepted=" << (ack.accepted ? "true" : "false")
               << " session_id=" << ack.session_id << " reason=" << ack.reason << "\n";
 
-    if (!raw_cmd_mode) {
+    if (mode == ClientMode::kDataBatch) {
       cstp::DataBatchPayload batch;
       batch.batch_id = 1001;
       batch.device_id = hello.device_id;
@@ -167,12 +229,12 @@ int main(int argc, char** argv) {
       cstp::Frame data_frame;
       data_frame.header.type = cstp::MessageType::kDataBatch;
       data_frame.header.flags = cstp::FrameFlags::kAckRequired;
-      data_frame.header.message_id = 2;
+      data_frame.header.message_id = next_message_id++;
       data_frame.header.stream_id = cstp::StreamId::kData;
       data_frame.header.timestamp_ms = cstp::UnixMillisNow();
       data_frame.payload = cstp::EncodeDataBatchPayload(batch);
-
       cstp::SendFrame(fd, data_frame);
+
       std::cout << "DATA_BATCH sent msg_id=" << data_frame.header.message_id
                 << " batch_id=" << batch.batch_id
                 << " sensors=" << batch.sensors.size() << "\n";
@@ -187,9 +249,10 @@ int main(int argc, char** argv) {
                 << " acked_msg_id=" << data_ack.acked_message_id
                 << " batch_id=" << data_ack.batch_id
                 << " note=" << data_ack.note << "\n";
+      return 0;
     }
 
-    if (raw_cmd_mode) {
+    if (mode == ClientMode::kCmd) {
       cstp::CommandRequestPayload command_request;
       command_request.command_id = 5001;
       command_request.target_device_id = hello.device_id;
@@ -201,7 +264,7 @@ int main(int argc, char** argv) {
       cstp::Frame command_frame;
       command_frame.header.type = cstp::MessageType::kCmdReq;
       command_frame.header.flags = cstp::FrameFlags::kAckRequired;
-      command_frame.header.message_id = 3;
+      command_frame.header.message_id = next_message_id++;
       command_frame.header.stream_id = cstp::StreamId::kControl;
       command_frame.header.timestamp_ms = cstp::UnixMillisNow();
       command_frame.payload = cstp::EncodeCommandRequestPayload(command_request);
@@ -221,6 +284,109 @@ int main(int argc, char** argv) {
                 << " status_code=" << command_response.status_code
                 << " message=" << command_response.message
                 << " result_json=" << command_response.result_json << "\n";
+      return 0;
+    }
+
+    if (mode == ClientMode::kPublish) {
+      cstp::PublishPayload publish_request;
+      publish_request.packet_id = 6001;
+      publish_request.topic = publish_topic;
+      publish_request.qos = publish_qos;
+      publish_request.retain = publish_retain;
+      publish_request.payload = std::vector<std::uint8_t>(publish_text.begin(), publish_text.end());
+
+      cstp::Frame publish_frame;
+      publish_frame.header.type = cstp::MessageType::kPublish;
+      publish_frame.header.flags =
+          publish_qos > 0 ? cstp::FrameFlags::kAckRequired : cstp::FrameFlags::kNone;
+      publish_frame.header.message_id = next_message_id++;
+      publish_frame.header.stream_id = cstp::StreamId::kData;
+      publish_frame.header.timestamp_ms = cstp::UnixMillisNow();
+      publish_frame.payload = cstp::EncodePublishPayload(publish_request);
+      cstp::SendFrame(fd, publish_frame);
+
+      std::cout << "PUBLISH sent topic=" << publish_request.topic
+                << " qos=" << static_cast<int>(publish_request.qos)
+                << " retain=" << (publish_request.retain ? 1 : 0)
+                << " bytes=" << publish_request.payload.size() << "\n";
+
+      if (publish_qos > 0) {
+        const cstp::Frame puback_frame = cstp::ReceiveFrame(fd);
+        if (puback_frame.header.type != cstp::MessageType::kPubAck) {
+          throw cstp::ProtocolError("expected PUB_ACK after PUBLISH qos>0");
+        }
+        const cstp::PublishAckPayload puback = cstp::DecodePublishAckPayload(puback_frame.payload);
+        std::cout << "PUB_ACK packet_id=" << puback.packet_id
+                  << " status_code=" << puback.status_code
+                  << " message=" << puback.message << "\n";
+      }
+      return 0;
+    }
+
+    if (mode == ClientMode::kSubscribe) {
+      cstp::SubscribePayload sub_request;
+      sub_request.packet_id = 7001;
+      sub_request.topic_filter = subscribe_filter;
+      sub_request.requested_qos = subscribe_qos;
+
+      cstp::Frame sub_frame;
+      sub_frame.header.type = cstp::MessageType::kSubscribe;
+      sub_frame.header.flags = cstp::FrameFlags::kAckRequired;
+      sub_frame.header.message_id = next_message_id++;
+      sub_frame.header.stream_id = cstp::StreamId::kControl;
+      sub_frame.header.timestamp_ms = cstp::UnixMillisNow();
+      sub_frame.payload = cstp::EncodeSubscribePayload(sub_request);
+      cstp::SendFrame(fd, sub_frame);
+
+      const cstp::Frame suback_frame = cstp::ReceiveFrame(fd);
+      if (suback_frame.header.type != cstp::MessageType::kSubAck) {
+        throw cstp::ProtocolError("expected SUB_ACK after SUBSCRIBE");
+      }
+      const cstp::SubscribeAckPayload suback =
+          cstp::DecodeSubscribeAckPayload(suback_frame.payload);
+      std::cout << "SUB_ACK packet_id=" << suback.packet_id
+                << " qos=" << static_cast<int>(suback.granted_qos)
+                << " message=" << suback.message << "\n";
+      std::cout << "listening for publishes on filter '" << subscribe_filter << "'\n";
+
+      for (;;) {
+        const cstp::Frame incoming = cstp::ReceiveFrame(fd);
+        if (incoming.header.type == cstp::MessageType::kPublish) {
+          const cstp::PublishPayload publish = cstp::DecodePublishPayload(incoming.payload);
+          const std::string text(publish.payload.begin(), publish.payload.end());
+          std::cout << "PUBLISH topic=" << publish.topic
+                    << " qos=" << static_cast<int>(publish.qos)
+                    << " retain=" << (publish.retain ? 1 : 0)
+                    << " payload=\"" << text << "\"\n";
+
+          if (publish.qos > 0) {
+            cstp::PublishAckPayload puback;
+            puback.packet_id = publish.packet_id;
+            puback.status_code = 200;
+            puback.message = "ok";
+
+            cstp::Frame puback_frame;
+            puback_frame.header.type = cstp::MessageType::kPubAck;
+            puback_frame.header.flags = cstp::FrameFlags::kIsAck;
+            puback_frame.header.message_id = next_message_id++;
+            puback_frame.header.stream_id = cstp::StreamId::kControl;
+            puback_frame.header.timestamp_ms = cstp::UnixMillisNow();
+            puback_frame.payload = cstp::EncodePublishAckPayload(puback);
+            cstp::SendFrame(fd, puback_frame);
+          }
+          continue;
+        }
+
+        if (incoming.header.type == cstp::MessageType::kError) {
+          const cstp::ErrorPayload error = cstp::DecodeErrorPayload(incoming.payload);
+          std::cout << "ERROR code=" << static_cast<std::uint16_t>(error.code)
+                    << " message=" << error.message << "\n";
+          continue;
+        }
+
+        std::cout << "ignoring unexpected frame type=" << cstp::ToString(incoming.header.type)
+                  << "\n";
+      }
     }
   } catch (const std::exception& e) {
     std::cerr << "protocol error: " << e.what() << "\n";

@@ -7,6 +7,7 @@ CSTP is a custom MQTT-like protocol optimized for:
 - High data volume sent at low frequency (batched sends)
 - Multiple sensors in one transfer
 - Simple device control commands
+- Brokered topic pub/sub messaging
 - Fully custom wire format and reliability behavior
 
 This version defines the wire contract and defaults.
@@ -84,6 +85,12 @@ Constants:
 | DATA_ACK | `0x11` | 1 |
 | CMD_REQ | `0x20` | 0 |
 | CMD_RESP | `0x21` | 0 |
+| PUBLISH | `0x40` | 1 |
+| PUB_ACK | `0x41` | 0 |
+| SUBSCRIBE | `0x42` | 0 |
+| SUB_ACK | `0x43` | 0 |
+| UNSUBSCRIBE | `0x44` | 0 |
+| UNSUB_ACK | `0x45` | 0 |
 | HEARTBEAT | `0x30` | 0 |
 | ERROR | `0x7F` | 0 |
 
@@ -171,6 +178,48 @@ Constants:
 2. `related_msg_id` (u32)
 3. `message` (str)
 
+### 8.9 PUBLISH (`0x40`)
+
+1. `packet_id` (u32)
+2. `topic` (str)
+3. `qos` (u8, `0..2`)
+4. `retain` (u8, `0`/`1`)
+5. `payload_size` (u32)
+6. `payload` (bytes)
+
+### 8.10 PUB_ACK (`0x41`)
+
+1. `packet_id` (u32)
+2. `status_code` (u16)
+3. `message` (str)
+
+### 8.11 SUBSCRIBE (`0x42`)
+
+1. `packet_id` (u32)
+2. `topic_filter` (str)
+3. `requested_qos` (u8, `0..2`)
+
+### 8.12 SUB_ACK (`0x43`)
+
+1. `packet_id` (u32)
+2. `granted_qos` (u8, `0..2`)
+3. `message` (str)
+
+### 8.13 UNSUBSCRIBE (`0x44`)
+
+1. `packet_id` (u32)
+2. `topic_filter` (str)
+
+### 8.14 UNSUB_ACK (`0x45`)
+
+1. `packet_id` (u32)
+2. `message` (str)
+
+Topic filter semantics:
+
+- `+` matches exactly one topic level
+- `#` matches remaining levels and must be the final filter level
+
 Error code set:
 
 - `1001` malformed_frame
@@ -191,6 +240,12 @@ For frames with `ACK_REQUIRED`:
 3. Retry until ACK received or `max_retries` reached.
 4. On exhaustion, connection may be dropped and re-established.
 
+Broker-specific:
+
+- `SUBSCRIBE` receives `SUB_ACK` (same `packet_id`).
+- `UNSUBSCRIBE` receives `UNSUB_ACK` (same `packet_id`).
+- `PUBLISH` with `qos > 0` receives `PUB_ACK` (same `packet_id`).
+
 Receiver dedup rule:
 
 - Keep a short-lived cache key: `(device_id, stream_id, msg_id)`.
@@ -210,4 +265,5 @@ Receiver dedup rule:
 2. Add strict decode validation and fuzz tests.
 3. Build server receive path: `HELLO -> DATA_BATCH -> DATA_ACK`.
 4. Add command path: `CMD_REQ/CMD_RESP`.
-5. Add persistence and replay support as needed.
+5. Add broker path: `SUBSCRIBE/SUB_ACK`, `PUBLISH/PUB_ACK`, `UNSUBSCRIBE/UNSUB_ACK`.
+6. Add persistence and replay support as needed.

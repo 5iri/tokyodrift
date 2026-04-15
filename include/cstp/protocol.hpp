@@ -43,6 +43,12 @@ enum class MessageType : std::uint8_t {
   kDataAck = 0x11,
   kCmdReq = 0x20,
   kCmdResp = 0x21,
+  kPublish = 0x40,
+  kPubAck = 0x41,
+  kSubscribe = 0x42,
+  kSubAck = 0x43,
+  kUnsubscribe = 0x44,
+  kUnsubAck = 0x45,
   kHeartbeat = 0x30,
   kError = 0x7F,
 };
@@ -160,6 +166,42 @@ struct CommandResponsePayload {
   std::string result_json;
 };
 
+struct PublishPayload {
+  std::uint32_t packet_id = 0;
+  std::string topic;
+  std::uint8_t qos = 0;
+  bool retain = false;
+  std::vector<std::uint8_t> payload;
+};
+
+struct PublishAckPayload {
+  std::uint32_t packet_id = 0;
+  std::uint16_t status_code = 0;
+  std::string message;
+};
+
+struct SubscribePayload {
+  std::uint32_t packet_id = 0;
+  std::string topic_filter;
+  std::uint8_t requested_qos = 0;
+};
+
+struct SubscribeAckPayload {
+  std::uint32_t packet_id = 0;
+  std::uint8_t granted_qos = 0;
+  std::string message;
+};
+
+struct UnsubscribePayload {
+  std::uint32_t packet_id = 0;
+  std::string topic_filter;
+};
+
+struct UnsubscribeAckPayload {
+  std::uint32_t packet_id = 0;
+  std::string message;
+};
+
 struct HeartbeatPayload {
   std::uint64_t uptime_ms = 0;
   std::uint16_t pending_batches = 0;
@@ -212,6 +254,24 @@ CommandRequestPayload DecodeCommandRequestPayload(std::span<const std::uint8_t> 
 
 std::vector<std::uint8_t> EncodeCommandResponsePayload(const CommandResponsePayload& payload);
 CommandResponsePayload DecodeCommandResponsePayload(std::span<const std::uint8_t> bytes);
+
+std::vector<std::uint8_t> EncodePublishPayload(const PublishPayload& payload);
+PublishPayload DecodePublishPayload(std::span<const std::uint8_t> bytes);
+
+std::vector<std::uint8_t> EncodePublishAckPayload(const PublishAckPayload& payload);
+PublishAckPayload DecodePublishAckPayload(std::span<const std::uint8_t> bytes);
+
+std::vector<std::uint8_t> EncodeSubscribePayload(const SubscribePayload& payload);
+SubscribePayload DecodeSubscribePayload(std::span<const std::uint8_t> bytes);
+
+std::vector<std::uint8_t> EncodeSubscribeAckPayload(const SubscribeAckPayload& payload);
+SubscribeAckPayload DecodeSubscribeAckPayload(std::span<const std::uint8_t> bytes);
+
+std::vector<std::uint8_t> EncodeUnsubscribePayload(const UnsubscribePayload& payload);
+UnsubscribePayload DecodeUnsubscribePayload(std::span<const std::uint8_t> bytes);
+
+std::vector<std::uint8_t> EncodeUnsubscribeAckPayload(const UnsubscribeAckPayload& payload);
+UnsubscribeAckPayload DecodeUnsubscribeAckPayload(std::span<const std::uint8_t> bytes);
 
 std::vector<std::uint8_t> EncodeHeartbeatPayload(const HeartbeatPayload& payload);
 HeartbeatPayload DecodeHeartbeatPayload(std::span<const std::uint8_t> bytes);

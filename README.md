@@ -5,6 +5,7 @@ C++20 starter implementation for a custom MQTT-like protocol focused on:
 - batched multi-sensor transfers
 - low-frequency/high-volume uplink
 - explicit control-command messages
+- brokered topic publish/subscribe flow (`SUBSCRIBE`, `PUBLISH`, `PUB_ACK`)
 
 Protocol spec: `docs/protocol-v0.md`
 
@@ -36,6 +37,32 @@ Terminal 2:
 ```
 
 The client sends `HELLO`, receives `HELLO_ACK`, then sends one sample `DATA_BATCH` and expects `DATA_ACK`.
+
+## MQTT-like Topic Broker Flow
+
+Start broker/server:
+
+```bash
+CSTP_GPIO_MODE=mock ./build/cstp_server 18830
+```
+
+Terminal 2 (subscriber):
+
+```bash
+./build/cstp_client 127.0.0.1 18830 sub 'demo/topic' 1
+```
+
+Terminal 3 (publisher):
+
+```bash
+./build/cstp_client 127.0.0.1 18830 pub 'demo/topic' 'hello world' 1 0
+```
+
+Notes:
+
+- Topic filters support MQTT-style wildcards: `+` (single level), `#` (multi-level suffix).
+- QoS `0` and `1` are supported in the current client/server.
+- Broker currently keeps subscriptions in-memory only.
 
 ## Generic Control Plane (RPi)
 

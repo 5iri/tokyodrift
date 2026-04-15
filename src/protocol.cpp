@@ -13,6 +13,10 @@ void Require(bool condition, const std::string& message) {
   }
 }
 
+void ValidateQos(std::uint8_t qos, const std::string& field_name) {
+  Require(qos <= 2, field_name + " must be 0..2");
+}
+
 void AppendU8(std::vector<std::uint8_t>* out, std::uint8_t value) { out->push_back(value); }
 
 void AppendU16(std::vector<std::uint8_t>* out, std::uint16_t value) {
@@ -189,6 +193,18 @@ std::string ToString(MessageType type) {
       return "CMD_REQ";
     case MessageType::kCmdResp:
       return "CMD_RESP";
+    case MessageType::kPublish:
+      return "PUBLISH";
+    case MessageType::kPubAck:
+      return "PUB_ACK";
+    case MessageType::kSubscribe:
+      return "SUBSCRIBE";
+    case MessageType::kSubAck:
+      return "SUB_ACK";
+    case MessageType::kUnsubscribe:
+      return "UNSUBSCRIBE";
+    case MessageType::kUnsubAck:
+      return "UNSUB_ACK";
     case MessageType::kHeartbeat:
       return "HEARTBEAT";
     case MessageType::kError:
@@ -523,6 +539,134 @@ CommandResponsePayload DecodeCommandResponsePayload(std::span<const std::uint8_t
   out.message = cur.ReadString();
   out.result_json = cur.ReadString();
   cur.RequireFinished("CMD_RESP payload");
+  return out;
+}
+
+std::vector<std::uint8_t> EncodePublishPayload(const PublishPayload& payload) {
+  ValidateQos(payload.qos, "PUBLISH qos");
+  Require(!payload.topic.empty(), "PUBLISH requires topic");
+  Require(payload.payload.size() <= std::numeric_limits<std::uint32_t>::max(),
+          "PUBLISH payload too large");
+
+  std::vector<std::uint8_t> bytes;
+  AppendU32(&bytes, payload.packet_id);
+  AppendString(&bytes, payload.topic);
+  AppendU8(&bytes, payload.qos);
+  AppendU8(&bytes, payload.retain ? 1 : 0);
+  AppendU32(&bytes, static_cast<std::uint32_t>(payload.payload.size()));
+  AppendBytes(&bytes, payload.payload);
+  return bytes;
+}
+
+PublishPayload DecodePublishPayload(std::span<const std::uint8_t> bytes) {
+  Cursor cur(bytes);
+  PublishPayload out;
+  out.packet_id = cur.ReadU32();
+  out.topic = cur.ReadString();
+  out.qos = cur.ReadU8();
+  ValidateQos(out.qos, "PUBLISH qos");
+  out.retain = cur.ReadU8() == 1;
+  const std::uint32_t payload_size = cur.ReadU32();
+  out.payload = cur.ReadBytes(payload_size);
+  Require(!out.topic.empty(), "PUBLISH requires topic");
+  cur.RequireFinished("PUBLISH payload");
+  return out;
+}
+
+std::vector<std::uint8_t> EncodePublishAckPayload(const PublishAckPayload& payload) {
+  std::vector<std::uint8_t> bytes;
+  AppendU32(&bytes, payload.packet_id);
+  AppendU16(&bytes, payload.status_code);
+  AppendString(&bytes, payload.message);
+  return bytes;
+}
+
+PublishAckPayload DecodePublishAckPayload(std::span<const std::uint8_t> bytes) {
+  Cursor cur(bytes);
+  PublishAckPayload out;
+  out.packet_id = cur.ReadU32();
+  out.status_code = cur.ReadU16();
+  out.message = cur.ReadString();
+  cur.RequireFinished("PUB_ACK payload");
+  return out;
+}
+
+std::vector<std::uint8_t> EncodeSubscribePayload(const SubscribePayload& payload) {
+  ValidateQos(payload.requested_qos, "SUBSCRIBE requested_qos");
+  Require(!payload.topic_filter.empty(), "SUBSCRIBE requires topic_filter");
+
+  std::vector<std::uint8_t> bytes;
+  AppendU32(&bytes, payload.packet_id);
+  AppendString(&bytes, payload.topic_filter);
+  AppendU8(&bytes, payload.requested_qos);
+  return bytes;
+}
+
+SubscribePayload DecodeSubscribePayload(std::span<const std::uint8_t> bytes) {
+  Cursor cur(bytes);
+  SubscribePayload out;
+  out.packet_id = cur.ReadU32();
+  out.topic_filter = cur.ReadString();
+  out.requested_qos = cur.ReadU8();
+  ValidateQos(out.requested_qos, "SUBSCRIBE requested_qos");
+  Require(!out.topic_filter.empty(), "SUBSCRIBE requires topic_filter");
+  cur.RequireFinished("SUBSCRIBE payload");
+  return out;
+}
+
+std::vector<std::uint8_t> EncodeSubscribeAckPayload(const SubscribeAckPayload& payload) {
+  ValidateQos(payload.granted_qos, "SUB_ACK granted_qos");
+
+  std::vector<std::uint8_t> bytes;
+  AppendU32(&bytes, payload.packet_id);
+  AppendU8(&bytes, payload.granted_qos);
+  AppendString(&bytes, payload.message);
+  return bytes;
+}
+
+SubscribeAckPayload DecodeSubscribeAckPayload(std::span<const std::uint8_t> bytes) {
+  Cursor cur(bytes);
+  SubscribeAckPayload out;
+  out.packet_id = cur.ReadU32();
+  out.granted_qos = cur.ReadU8();
+  ValidateQos(out.granted_qos, "SUB_ACK granted_qos");
+  out.message = cur.ReadString();
+  cur.RequireFinished("SUB_ACK payload");
+  return out;
+}
+
+std::vector<std::uint8_t> EncodeUnsubscribePayload(const UnsubscribePayload& payload) {
+  Require(!payload.topic_filter.empty(), "UNSUBSCRIBE requires topic_filter");
+
+  std::vector<std::uint8_t> bytes;
+  AppendU32(&bytes, payload.packet_id);
+  AppendString(&bytes, payload.topic_filter);
+  return bytes;
+}
+
+UnsubscribePayload DecodeUnsubscribePayload(std::span<const std::uint8_t> bytes) {
+  Cursor cur(bytes);
+  UnsubscribePayload out;
+  out.packet_id = cur.ReadU32();
+  out.topic_filter = cur.ReadString();
+  Require(!out.topic_filter.empty(), "UNSUBSCRIBE requires topic_filter");
+  cur.RequireFinished("UNSUBSCRIBE payload");
+  return out;
+}
+
+std::vector<std::uint8_t> EncodeUnsubscribeAckPayload(const UnsubscribeAckPayload& payload) {
+  std::vector<std::uint8_t> bytes;
+  AppendU32(&bytes, payload.packet_id);
+  AppendString(&bytes, payload.message);
+  return bytes;
+}
+
+UnsubscribeAckPayload DecodeUnsubscribeAckPayload(std::span<const std::uint8_t> bytes) {
+  Cursor cur(bytes);
+  UnsubscribeAckPayload out;
+  out.packet_id = cur.ReadU32();
+  out.message = cur.ReadString();
+  cur.RequireFinished("UNSUB_ACK payload");
   return out;
 }
 

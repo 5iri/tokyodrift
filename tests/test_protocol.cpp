@@ -98,12 +98,58 @@ void TestDataBatchRoundTrip() {
   assert(decoded.sensors[1].samples[0].value[0] == 1);
 }
 
+void TestBrokerPayloadRoundTrip() {
+  cstp::PublishPayload publish;
+  publish.packet_id = 9001;
+  publish.topic = "devices/lab-1/status";
+  publish.qos = 1;
+  publish.retain = true;
+  publish.payload = std::vector<std::uint8_t>{'h', 'e', 'l', 'l', 'o'};
+
+  const std::vector<std::uint8_t> publish_encoded = cstp::EncodePublishPayload(publish);
+  const cstp::PublishPayload publish_decoded = cstp::DecodePublishPayload(publish_encoded);
+  assert(publish_decoded.packet_id == publish.packet_id);
+  assert(publish_decoded.topic == publish.topic);
+  assert(publish_decoded.qos == publish.qos);
+  assert(publish_decoded.retain == publish.retain);
+  assert(publish_decoded.payload == publish.payload);
+
+  cstp::SubscribePayload subscribe;
+  subscribe.packet_id = 42;
+  subscribe.topic_filter = "devices/+/status";
+  subscribe.requested_qos = 1;
+  const std::vector<std::uint8_t> sub_encoded = cstp::EncodeSubscribePayload(subscribe);
+  const cstp::SubscribePayload sub_decoded = cstp::DecodeSubscribePayload(sub_encoded);
+  assert(sub_decoded.packet_id == subscribe.packet_id);
+  assert(sub_decoded.topic_filter == subscribe.topic_filter);
+  assert(sub_decoded.requested_qos == subscribe.requested_qos);
+
+  cstp::SubscribeAckPayload suback;
+  suback.packet_id = subscribe.packet_id;
+  suback.granted_qos = 1;
+  suback.message = "ok";
+  const std::vector<std::uint8_t> suback_encoded = cstp::EncodeSubscribeAckPayload(suback);
+  const cstp::SubscribeAckPayload suback_decoded = cstp::DecodeSubscribeAckPayload(suback_encoded);
+  assert(suback_decoded.packet_id == suback.packet_id);
+  assert(suback_decoded.granted_qos == suback.granted_qos);
+  assert(suback_decoded.message == suback.message);
+
+  cstp::UnsubscribePayload unsubscribe;
+  unsubscribe.packet_id = 43;
+  unsubscribe.topic_filter = "devices/#";
+  const std::vector<std::uint8_t> unsub_encoded = cstp::EncodeUnsubscribePayload(unsubscribe);
+  const cstp::UnsubscribePayload unsub_decoded = cstp::DecodeUnsubscribePayload(unsub_encoded);
+  assert(unsub_decoded.packet_id == unsubscribe.packet_id);
+  assert(unsub_decoded.topic_filter == unsubscribe.topic_filter);
+}
+
 }  // namespace
 
 int main() {
   TestFrameRoundTrip();
   TestCrcMismatchRejected();
   TestDataBatchRoundTrip();
+  TestBrokerPayloadRoundTrip();
 
   std::cout << "All CSTP protocol tests passed\n";
   return 0;

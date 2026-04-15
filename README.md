@@ -37,13 +37,14 @@ Terminal 2:
 
 The client sends `HELLO`, receives `HELLO_ACK`, then sends one sample `DATA_BATCH` and expects `DATA_ACK`.
 
-## Remote LED Command (RPi)
+## Generic Control Plane (RPi)
 
-Server supports `CMD_REQ` with command names:
+Server supports a generic endpoint command namespace:
 
-- `led_on`
-- `led_off`
-- `led_set` (requires value)
+- `endpoint.register`
+- `endpoint.write`
+- `endpoint.list`
+- `endpoint.unregister`
 
 Start receiver on Pi (real GPIO via sysfs):
 
@@ -51,18 +52,37 @@ Start receiver on Pi (real GPIO via sysfs):
 CSTP_GPIO_MODE=sysfs CSTP_LED_PIN=17 ./build/cstp_server 18830
 ```
 
-From remote client, send command:
+For servo control, install pigpio and start daemon on Pi:
 
 ```bash
-./build/cstp_client <rpi-ip> 18830 led_on 17
-./build/cstp_client <rpi-ip> 18830 led_off 17
-./build/cstp_client <rpi-ip> 18830 led_set 17 1
-./build/cstp_client <rpi-ip> 18830 led_set 17 0
+sudo apt install -y pigpio
+sudo systemctl enable --now pigpiod
 ```
 
-When a command is provided, the client sends `HELLO` then `CMD_REQ` directly.
+Raw command mode from client:
 
-Command response is printed as `CMD_RESP` with status code and result JSON.
+```bash
+./build/cstp_client <rpi-ip> 18830 cmd endpoint.register '{"name":"status_led","kind":"digital_out","pin":27,"active_low":0}'
+./build/cstp_client <rpi-ip> 18830 cmd endpoint.register '{"name":"pan_servo","kind":"pwm_out","pin":18,"min_pulse_us":500,"max_pulse_us":2500}'
+./build/cstp_client <rpi-ip> 18830 cmd endpoint.list '{}'
+./build/cstp_client <rpi-ip> 18830 cmd endpoint.write '{"name":"status_led","value":1}'
+./build/cstp_client <rpi-ip> 18830 cmd endpoint.write '{"name":"pan_servo","pulse_us":1500}'
+./build/cstp_client <rpi-ip> 18830 cmd endpoint.unregister '{"name":"status_led"}'
+```
+
+Direct pin control (without registry) is also available:
+
+```bash
+./build/cstp_client <rpi-ip> 18830 cmd pin.write '{"pin":17,"value":1}'
+./build/cstp_client <rpi-ip> 18830 cmd pin.pwm '{"pin":18,"pulse_us":1500}'
+```
+
+When a command is provided, the client sends `HELLO` then `CMD_REQ` directly. `CMD_RESP` includes status and result JSON.
+
+Notes:
+
+- Endpoint registry is in-memory for now (resets on server restart).
+- `pwm_out` range defaults to `500..2500`, and `pulse_us=0` stops pulses.
 
 ## Layout
 

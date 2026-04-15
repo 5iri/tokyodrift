@@ -1,7 +1,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
-#include <optional>
 #include <string>
 #include <vector>
 
@@ -80,54 +79,29 @@ std::vector<std::uint8_t> EncodeBool(bool value) {
   return std::vector<std::uint8_t>{static_cast<std::uint8_t>(value ? 1 : 0)};
 }
 
-std::optional<bool> ParseBoolToken(const std::string& token) {
-  if (token == "1" || token == "true" || token == "on") {
-    return true;
-  }
-  if (token == "0" || token == "false" || token == "off") {
-    return false;
-  }
-  return std::nullopt;
-}
-
-bool IsSupportedCommand(const std::string& name) {
-  return name == "led_on" || name == "led_off" || name == "led_set";
-}
-
 int main(int argc, char** argv) {
   const std::string host = (argc > 1) ? argv[1] : "127.0.0.1";
   const std::string port = (argc > 2) ? argv[2] : "18830";
-  const std::string command_name = (argc > 3) ? argv[3] : "";
+  const std::string command_mode = (argc > 3) ? argv[3] : "";
+  bool raw_cmd_mode = false;
+  std::string raw_command_name;
+  std::string raw_args_json;
 
-  int command_pin = 17;
-  if (argc > 4) {
-    try {
-      command_pin = std::stoi(argv[4]);
-    } catch (...) {
-      std::cerr << "invalid pin argument\n";
+  if (!command_mode.empty()) {
+    if (command_mode != "cmd") {
+      std::cerr << "legacy command aliases removed. use raw mode:\n";
+      std::cerr
+          << "./build/cstp_client <host> <port> cmd <command_name> '<args_json>'\n";
       return 1;
     }
-  }
-
-  std::optional<bool> command_value;
-  if (!command_name.empty()) {
-    if (!IsSupportedCommand(command_name)) {
-      std::cerr << "unsupported command: " << command_name << "\n";
-      std::cerr << "supported commands: led_on, led_off, led_set\n";
+    if (argc <= 5) {
+      std::cerr
+          << "raw cmd mode usage: ./build/cstp_client <host> <port> cmd <command_name> '<args_json>'\n";
       return 1;
     }
-
-    if (command_name == "led_set") {
-      if (argc <= 5) {
-        std::cerr << "led_set requires a value argument: 1/0 true/false on/off\n";
-        return 1;
-      }
-      command_value = ParseBoolToken(argv[5]);
-      if (!command_value.has_value()) {
-        std::cerr << "invalid led_set value: " << argv[5] << "\n";
-        return 1;
-      }
-    }
+    raw_cmd_mode = true;
+    raw_command_name = argv[4];
+    raw_args_json = argv[5];
   }
 
   const int fd = ConnectTcp(host, port);
@@ -165,7 +139,7 @@ int main(int argc, char** argv) {
     std::cout << "HELLO_ACK accepted=" << (ack.accepted ? "true" : "false")
               << " session_id=" << ack.session_id << " reason=" << ack.reason << "\n";
 
-    if (command_name.empty()) {
+    if (!raw_cmd_mode) {
       cstp::DataBatchPayload batch;
       batch.batch_id = 1001;
       batch.device_id = hello.device_id;
@@ -215,19 +189,14 @@ int main(int argc, char** argv) {
                 << " note=" << data_ack.note << "\n";
     }
 
-    if (!command_name.empty()) {
+    if (raw_cmd_mode) {
       cstp::CommandRequestPayload command_request;
       command_request.command_id = 5001;
       command_request.target_device_id = hello.device_id;
       command_request.target_sensor_id = 65535;
-      command_request.command_name = command_name;
+      command_request.command_name = raw_command_name;
       command_request.timeout_ms = 2000;
-      command_request.args_json = "{\"pin\":" + std::to_string(command_pin);
-      if (command_name == "led_set") {
-        command_request.args_json +=
-            ",\"value\":" + std::to_string(command_value.value() ? 1 : 0);
-      }
-      command_request.args_json += "}";
+      command_request.args_json = raw_args_json;
 
       cstp::Frame command_frame;
       command_frame.header.type = cstp::MessageType::kCmdReq;

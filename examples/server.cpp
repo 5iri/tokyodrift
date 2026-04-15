@@ -458,18 +458,33 @@ bool SetServoPulsePigpio(int pin, int pulse_us, std::string* error) {
     return false;
   }
 
-  std::array<char, 96> cmd{};
-  const int n = std::snprintf(cmd.data(), cmd.size(), "pigs s %d %d >/dev/null 2>&1", pin, pulse_us);
+  std::array<char, 128> cmd{};
+  const int n = std::snprintf(cmd.data(), cmd.size(), "pigs s %d %d 2>&1", pin, pulse_us);
   if (n <= 0 || static_cast<std::size_t>(n) >= cmd.size()) {
     *error = "failed to build pigpio command";
     return false;
   }
 
-  const int rc = std::system(cmd.data());
-  if (rc != 0) {
-    *error = "pigs command failed (is pigpiod running?)";
+  std::array<char, 256> output{};
+  std::string captured;
+  FILE* pipe = popen(cmd.data(), "r");
+  if (pipe == nullptr) {
+    *error = "popen failed for pigs command";
     return false;
   }
+  while (std::fgets(output.data(), static_cast<int>(output.size()), pipe) != nullptr) {
+    captured += output.data();
+  }
+  const int rc = pclose(pipe);
+  if (rc != 0) {
+    while (!captured.empty() && captured.back() == '\n') {
+      captured.pop_back();
+    }
+    *error = "pigs command failed (rc=" + std::to_string(rc) + "): " +
+             (captured.empty() ? "is pigpiod running?" : captured);
+    return false;
+  }
+  std::cout << "pigpio: set servo pin=" << pin << " pulse_us=" << pulse_us << "\n";
   return true;
 }
 
@@ -508,12 +523,15 @@ bool ApplyPwmOutput(int pin, int pulse_us, int min_pulse_us, int max_pulse_us, G
 
   std::string pigpio_error;
   if (SetServoPulsePigpio(pin, pulse_us, &pigpio_error)) {
+    std::cout << "PWM auto: using pigpio for pin=" << pin << "\n";
     return true;
   }
+  std::cerr << "PWM auto: pigpio failed: " << pigpio_error << "\n";
 
   if (soft_pwm != nullptr) {
     std::string soft_pwm_error;
     if (soft_pwm->SetPulseUs(pin, pulse_us, &soft_pwm_error)) {
+      std::cout << "PWM auto: falling back to sysfs_soft for pin=" << pin << "\n";
       return true;
     }
     *error = "pigpio failed: " + pigpio_error + "; sysfs_soft failed: " + soft_pwm_error;

@@ -542,6 +542,119 @@ bool ApplyPwmOutput(int pin, int pulse_us, int min_pulse_us, int max_pulse_us, G
   return false;
 }
 
+class ServoSweepManager {
+ public:
+  ServoSweepManager() = default;
+  ~ServoSweepManager() { StopAll(); }
+
+  ServoSweepManager(const ServoSweepManager&) = delete;
+  ServoSweepManager& operator=(const ServoSweepManager&) = delete;
+
+  bool Start(int pin, int min_us, int max_us, int step_us, int step_delay_ms,
+             GpioMode gpio_mode, PwmBackend pwm_backend, SoftPwmManager* soft_pwm,
+             std::string* error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = workers_.find(pin);
+    if (it != workers_.end()) {
+      it->second->stop.store(true, std::memory_order_relaxed);
+      if (it->second->thread.joinable()) {
+        it->second->thread.join();
+      }
+      workers_.erase(it);
+    }
+
+    auto worker = std::make_unique<Worker>();
+    worker->pin = pin;
+    worker->min_us = min_us;
+    worker->max_us = max_us;
+    worker->step_us = step_us;
+    worker->step_delay_ms = step_delay_ms;
+    worker->gpio_mode = gpio_mode;
+    worker->pwm_backend = pwm_backend;
+    worker->soft_pwm = soft_pwm;
+
+    worker->thread = std::thread([raw = worker.get()]() { SweepLoop(raw); });
+    workers_[pin] = std::move(worker);
+    return true;
+  }
+
+  bool Stop(int pin, GpioMode gpio_mode, PwmBackend pwm_backend, SoftPwmManager* soft_pwm,
+            std::string* error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = workers_.find(pin);
+    if (it == workers_.end()) {
+      *error = "no sweep running on pin " + std::to_string(pin);
+      return false;
+    }
+    it->second->stop.store(true, std::memory_order_relaxed);
+    if (it->second->thread.joinable()) {
+      it->second->thread.join();
+    }
+    workers_.erase(it);
+
+    std::string pwm_error;
+    (void)ApplyPwmOutput(pin, 0, 0, 2500, gpio_mode, pwm_backend, soft_pwm, &pwm_error);
+    return true;
+  }
+
+  void StopAll() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& [pin, worker] : workers_) {
+      (void)pin;
+      worker->stop.store(true, std::memory_order_relaxed);
+    }
+    for (auto& [pin, worker] : workers_) {
+      (void)pin;
+      if (worker->thread.joinable()) {
+        worker->thread.join();
+      }
+    }
+    workers_.clear();
+  }
+
+ private:
+  struct Worker {
+    int pin = -1;
+    int min_us = 500;
+    int max_us = 2500;
+    int step_us = 50;
+    int step_delay_ms = 20;
+    GpioMode gpio_mode = GpioMode::kMock;
+    PwmBackend pwm_backend = PwmBackend::kAuto;
+    SoftPwmManager* soft_pwm = nullptr;
+    std::atomic<bool> stop{false};
+    std::thread thread;
+  };
+
+  static void SweepLoop(Worker* w) {
+    int pulse = w->min_us;
+    int direction = 1;
+
+    while (!w->stop.load(std::memory_order_relaxed)) {
+      std::string error;
+      if (!ApplyPwmOutput(w->pin, pulse, w->min_us, w->max_us, w->gpio_mode,
+                          w->pwm_backend, w->soft_pwm, &error)) {
+        std::cerr << "sweep pin=" << w->pin << " failed: " << error << "\n";
+        return;
+      }
+
+      pulse += direction * w->step_us;
+      if (pulse >= w->max_us) {
+        pulse = w->max_us;
+        direction = -1;
+      } else if (pulse <= w->min_us) {
+        pulse = w->min_us;
+        direction = 1;
+      }
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(w->step_delay_ms));
+    }
+  }
+
+  std::mutex mutex_;
+  std::unordered_map<int, std::unique_ptr<Worker>> workers_;
+};
+
 bool IsSupportedEndpointKind(const std::string& kind) {
   return kind == "digital_out" || kind == "pwm_out";
 }
@@ -568,7 +681,8 @@ CommandExecutionResult ExecuteCommand(const cstp::CommandRequestPayload& request
                                       const std::string& local_device_id, GpioMode gpio_mode,
                                       PwmBackend pwm_backend, int default_led_pin,
                                       EndpointRegistry* endpoint_registry,
-                                      SoftPwmManager* soft_pwm) {
+                                      SoftPwmManager* soft_pwm,
+                                      ServoSweepManager* servo_sweep) {
   CommandExecutionResult out;
 
   if (!request.target_device_id.empty() && request.target_device_id != local_device_id) {
@@ -777,6 +891,62 @@ CommandExecutionResult ExecuteCommand(const cstp::CommandRequestPayload& request
     return out;
   }
 
+  if (request.command_name == "pin.servo_sweep") {
+    const auto pin_arg = ExtractIntArg(request.args_json, "pin");
+    if (!pin_arg.has_value()) {
+      out.status_code = 400;
+      out.message = "pin.servo_sweep requires args_json.pin";
+      return out;
+    }
+
+    const auto min_arg = ExtractIntArg(request.args_json, "min_us");
+    const auto max_arg = ExtractIntArg(request.args_json, "max_us");
+    const auto step_arg = ExtractIntArg(request.args_json, "step_us");
+    const auto delay_arg = ExtractIntArg(request.args_json, "step_delay_ms");
+    const int min_us = min_arg.has_value() ? *min_arg : 500;
+    const int max_us = max_arg.has_value() ? *max_arg : 2500;
+    const int step_us = step_arg.has_value() ? *step_arg : 50;
+    const int step_delay_ms = delay_arg.has_value() ? *delay_arg : 20;
+
+    std::string error;
+    if (!servo_sweep->Start(*pin_arg, min_us, max_us, step_us, step_delay_ms,
+                            gpio_mode, pwm_backend, soft_pwm, &error)) {
+      out.status_code = 500;
+      out.message = "servo_sweep_failed: " + error;
+      return out;
+    }
+
+    out.status_code = 200;
+    out.message = "ok";
+    out.result_json = "{\"pin\":" + std::to_string(*pin_arg) +
+                      ",\"min_us\":" + std::to_string(min_us) +
+                      ",\"max_us\":" + std::to_string(max_us) +
+                      ",\"step_us\":" + std::to_string(step_us) +
+                      ",\"step_delay_ms\":" + std::to_string(step_delay_ms) + "}";
+    return out;
+  }
+
+  if (request.command_name == "pin.servo_stop") {
+    const auto pin_arg = ExtractIntArg(request.args_json, "pin");
+    if (!pin_arg.has_value()) {
+      out.status_code = 400;
+      out.message = "pin.servo_stop requires args_json.pin";
+      return out;
+    }
+
+    std::string error;
+    if (!servo_sweep->Stop(*pin_arg, gpio_mode, pwm_backend, soft_pwm, &error)) {
+      out.status_code = 404;
+      out.message = error;
+      return out;
+    }
+
+    out.status_code = 200;
+    out.message = "ok";
+    out.result_json = "{\"pin\":" + std::to_string(*pin_arg) + ",\"stopped\":1}";
+    return out;
+  }
+
   out.status_code = 400;
   out.message = "unsupported command_name";
   return out;
@@ -789,7 +959,7 @@ void LogFrameSummary(const cstp::Frame& frame) {
 
 void HandleClient(int client_fd, GpioMode gpio_mode, int default_led_pin,
                   PwmBackend pwm_backend, EndpointRegistry* endpoint_registry,
-                  SoftPwmManager* soft_pwm) {
+                  SoftPwmManager* soft_pwm, ServoSweepManager* servo_sweep) {
   const cstp::Frame hello_frame = cstp::ReceiveFrame(client_fd);
   if (hello_frame.header.type != cstp::MessageType::kHello) {
     throw cstp::ProtocolError("expected HELLO as first message");
@@ -865,7 +1035,7 @@ void HandleClient(int client_fd, GpioMode gpio_mode, int default_led_pin,
 
         const CommandExecutionResult exec =
             ExecuteCommand(request, hello.device_id, gpio_mode, pwm_backend, default_led_pin,
-                           endpoint_registry, soft_pwm);
+                           endpoint_registry, soft_pwm, servo_sweep);
 
         cstp::CommandResponsePayload response;
         response.command_id = request.command_id;
@@ -914,6 +1084,7 @@ int main(int argc, char** argv) {
   const PwmBackend pwm_backend = ResolvePwmBackend();
   const int default_led_pin = ResolveDefaultLedPin();
   SoftPwmManager soft_pwm;
+  ServoSweepManager servo_sweep;
   EndpointRegistry endpoint_registry;
   endpoint_registry["default"] = EndpointDefinition{
       .kind = "digital_out",
@@ -973,7 +1144,7 @@ int main(int argc, char** argv) {
     try {
       std::cout << "client connected\n";
       HandleClient(client_fd, gpio_mode, default_led_pin, pwm_backend, &endpoint_registry,
-                   &soft_pwm);
+                   &soft_pwm, &servo_sweep);
     } catch (const std::exception& e) {
       if (IsClientDisconnect(e)) {
         std::cout << "client disconnected\n";

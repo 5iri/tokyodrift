@@ -49,21 +49,24 @@ Server supports a generic endpoint command namespace:
 Start receiver on Pi (real GPIO via sysfs):
 
 ```bash
-CSTP_GPIO_MODE=sysfs CSTP_LED_PIN=17 ./build/cstp_server 18830
+CSTP_GPIO_MODE=sysfs CSTP_PWM_BACKEND=sysfs_soft CSTP_LED_PIN=17 ./build/cstp_server 18830
 ```
 
-For servo control, install pigpio and start daemon on Pi:
+PWM backend options:
 
 ```bash
-sudo apt install -y pigpio
-sudo systemctl enable --now pigpiod
+export CSTP_PWM_BACKEND=auto       # default: try pigpio, then built-in soft PWM
+export CSTP_PWM_BACKEND=pigpio     # require pigpio daemon
+export CSTP_PWM_BACKEND=sysfs_soft # built-in software PWM (no pigpiod)
 ```
+
+On Raspberry Pi OS `trixie`, `apt install pigpio` may be unavailable. If you want pigpio backend, build from source and run `pigpiod`; otherwise use `sysfs_soft`.
 
 Raw command mode from client:
 
 ```bash
 ./build/cstp_client <rpi-ip> 18830 cmd endpoint.register '{"name":"status_led","kind":"digital_out","pin":27,"active_low":0}'
-./build/cstp_client <rpi-ip> 18830 cmd endpoint.register '{"name":"pan_servo","kind":"pwm_out","pin":18,"min_pulse_us":500,"max_pulse_us":2500}'
+./build/cstp_client <rpi-ip> 18830 cmd endpoint.register '{"name":"pan_servo","kind":"pwm_out","pin":13,"min_pulse_us":500,"max_pulse_us":2500}'
 ./build/cstp_client <rpi-ip> 18830 cmd endpoint.list '{}'
 ./build/cstp_client <rpi-ip> 18830 cmd endpoint.write '{"name":"status_led","value":1}'
 ./build/cstp_client <rpi-ip> 18830 cmd endpoint.write '{"name":"pan_servo","pulse_us":1500}'
@@ -74,7 +77,7 @@ Direct pin control (without registry) is also available:
 
 ```bash
 ./build/cstp_client <rpi-ip> 18830 cmd pin.write '{"pin":17,"value":1}'
-./build/cstp_client <rpi-ip> 18830 cmd pin.pwm '{"pin":18,"pulse_us":1500}'
+./build/cstp_client <rpi-ip> 18830 cmd pin.pwm '{"pin":13,"pulse_us":1500}'
 ```
 
 When a command is provided, the client sends `HELLO` then `CMD_REQ` directly. `CMD_RESP` includes status and result JSON.
@@ -83,6 +86,7 @@ Notes:
 
 - Endpoint registry is in-memory for now (resets on server restart).
 - `pwm_out` range defaults to `500..2500`, and `pulse_us=0` stops pulses.
+- For MG995-like servos, start around `pulse_us=1500`, then sweep `1000..2000`.
 
 ## Layout
 

@@ -1,17 +1,25 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
+#include <chrono>
+#include <cerrno>
+#include <cstring>
 #include <fstream>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -42,6 +50,12 @@ class FdGuard {
 enum class GpioMode {
   kMock,
   kSysfs,
+};
+
+enum class PwmBackend {
+  kAuto,
+  kPigpio,
+  kSysfsSoft,
 };
 
 struct CommandExecutionResult {
@@ -96,6 +110,36 @@ int ResolveDefaultLedPin() {
 
 std::string GpioModeName(GpioMode mode) {
   return mode == GpioMode::kSysfs ? "sysfs" : "mock";
+}
+
+PwmBackend ResolvePwmBackend() {
+  const char* env = std::getenv("CSTP_PWM_BACKEND");
+  if (env == nullptr) {
+    return PwmBackend::kAuto;
+  }
+  const std::string value(env);
+  if (value == "auto") {
+    return PwmBackend::kAuto;
+  }
+  if (value == "pigpio") {
+    return PwmBackend::kPigpio;
+  }
+  if (value == "sysfs_soft") {
+    return PwmBackend::kSysfsSoft;
+  }
+  return PwmBackend::kAuto;
+}
+
+std::string PwmBackendName(PwmBackend backend) {
+  switch (backend) {
+    case PwmBackend::kAuto:
+      return "auto";
+    case PwmBackend::kPigpio:
+      return "pigpio";
+    case PwmBackend::kSysfsSoft:
+      return "sysfs_soft";
+  }
+  return "auto";
 }
 
 std::optional<std::size_t> FindKeyStart(const std::string& json, const std::string& key) {
@@ -207,6 +251,178 @@ bool ExistsFile(const std::string& path) {
   return in.good();
 }
 
+class SoftPwmManager {
+ public:
+  SoftPwmManager() = default;
+  ~SoftPwmManager() { Shutdown(); }
+
+  SoftPwmManager(const SoftPwmManager&) = delete;
+  SoftPwmManager& operator=(const SoftPwmManager&) = delete;
+
+  bool SetPulseUs(int pin, int pulse_us, std::string* error) {
+    if (pin < 0) {
+      *error = "invalid pin";
+      return false;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = workers_.find(pin);
+    if (it == workers_.end()) {
+      auto worker = std::make_unique<Worker>();
+      worker->pin = pin;
+      worker->pulse_us.store(pulse_us, std::memory_order_relaxed);
+
+      if (!PrepareWorker(worker.get(), error)) {
+        return false;
+      }
+
+      worker->thread = std::thread([this, raw_worker = worker.get()]() {
+        WorkerLoop(raw_worker);
+      });
+      workers_[pin] = std::move(worker);
+      return true;
+    }
+
+    it->second->pulse_us.store(pulse_us, std::memory_order_relaxed);
+    return true;
+  }
+
+  void Shutdown() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& [pin, worker] : workers_) {
+      (void)pin;
+      worker->stop.store(true, std::memory_order_relaxed);
+    }
+    for (auto& [pin, worker] : workers_) {
+      (void)pin;
+      if (worker->thread.joinable()) {
+        worker->thread.join();
+      }
+      if (worker->value_fd >= 0) {
+        close(worker->value_fd);
+        worker->value_fd = -1;
+      }
+    }
+    workers_.clear();
+  }
+
+ private:
+  struct Worker {
+    int pin = -1;
+    int value_fd = -1;
+    std::string value_path;
+    std::atomic<int> pulse_us{0};
+    std::atomic<bool> stop{false};
+    std::thread thread;
+  };
+
+  static bool EnsureOutputPinReady(int pin, std::string* value_path, std::string* error) {
+    const std::string gpio_base = "/sys/class/gpio/gpio" + std::to_string(pin);
+    const std::string out_value_path = gpio_base + "/value";
+    const std::string direction_path = gpio_base + "/direction";
+
+    if (!ExistsFile(out_value_path)) {
+      if (!WriteFile("/sys/class/gpio/export", std::to_string(pin), error) &&
+          !ExistsFile(out_value_path)) {
+        return false;
+      }
+    }
+
+    if (!WriteFile(direction_path, "out", error)) {
+      return false;
+    }
+
+    *value_path = out_value_path;
+    return true;
+  }
+
+  static bool WriteToFd(int fd, char value, std::string* error) {
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+      if (error != nullptr) {
+        *error = "lseek failed: " + std::string(std::strerror(errno));
+      }
+      return false;
+    }
+    const ssize_t written = write(fd, &value, 1);
+    if (written != 1) {
+      if (error != nullptr) {
+        *error = "write failed: " + std::string(std::strerror(errno));
+      }
+      return false;
+    }
+    return true;
+  }
+
+  static bool PrepareWorker(Worker* worker, std::string* error) {
+    if (!EnsureOutputPinReady(worker->pin, &worker->value_path, error)) {
+      return false;
+    }
+
+    worker->value_fd = open(worker->value_path.c_str(), O_WRONLY);
+    if (worker->value_fd < 0) {
+      *error = "open failed: " + worker->value_path + ": " + std::string(std::strerror(errno));
+      return false;
+    }
+    if (!WriteToFd(worker->value_fd, '0', error)) {
+      close(worker->value_fd);
+      worker->value_fd = -1;
+      return false;
+    }
+    return true;
+  }
+
+  static void SleepMicros(int micros) {
+    if (micros > 0) {
+      std::this_thread::sleep_for(std::chrono::microseconds(micros));
+    }
+  }
+
+  static void WorkerLoop(Worker* worker) {
+    constexpr int kPeriodUs = 20000;
+    constexpr int kMinPulseUs = 500;
+    constexpr int kMaxPulseUs = 2500;
+    bool logged_io_error = false;
+
+    while (!worker->stop.load(std::memory_order_relaxed)) {
+      int pulse = worker->pulse_us.load(std::memory_order_relaxed);
+      if (pulse < 0) {
+        pulse = 0;
+      }
+      if (pulse > 0) {
+        pulse = std::clamp(pulse, kMinPulseUs, kMaxPulseUs);
+      }
+
+      if (pulse == 0) {
+        std::string write_error;
+        if (!WriteToFd(worker->value_fd, '0', &write_error) && !logged_io_error) {
+          std::cerr << "soft PWM pin=" << worker->pin << " write failed: " << write_error << "\n";
+          logged_io_error = true;
+        }
+        SleepMicros(kPeriodUs);
+        continue;
+      }
+
+      std::string write_error;
+      if (!WriteToFd(worker->value_fd, '1', &write_error) && !logged_io_error) {
+        std::cerr << "soft PWM pin=" << worker->pin << " write failed: " << write_error << "\n";
+        logged_io_error = true;
+      }
+      SleepMicros(pulse);
+      if (!WriteToFd(worker->value_fd, '0', &write_error) && !logged_io_error) {
+        std::cerr << "soft PWM pin=" << worker->pin << " write failed: " << write_error << "\n";
+        logged_io_error = true;
+      }
+      SleepMicros(kPeriodUs - pulse);
+    }
+
+    std::string write_error;
+    (void)WriteToFd(worker->value_fd, '0', &write_error);
+  }
+
+  std::mutex mutex_;
+  std::unordered_map<int, std::unique_ptr<Worker>> workers_;
+};
+
 bool SetLedSysfs(int pin, bool value, std::string* error) {
   if (pin < 0) {
     *error = "invalid pin";
@@ -269,7 +485,7 @@ bool ApplyDigitalOutput(int pin, bool logical_value, bool active_low, GpioMode g
 }
 
 bool ApplyPwmOutput(int pin, int pulse_us, int min_pulse_us, int max_pulse_us, GpioMode gpio_mode,
-                    std::string* error) {
+                    PwmBackend pwm_backend, SoftPwmManager* soft_pwm, std::string* error) {
   if (pulse_us != 0 && (pulse_us < min_pulse_us || pulse_us > max_pulse_us)) {
     *error = "pulse_us must be within endpoint range";
     return false;
@@ -278,7 +494,34 @@ bool ApplyPwmOutput(int pin, int pulse_us, int min_pulse_us, int max_pulse_us, G
     std::cout << "MOCK PWM pin=" << pin << " pulse_us=" << pulse_us << "\n";
     return true;
   }
-  return SetServoPulsePigpio(pin, pulse_us, error);
+
+  if (pwm_backend == PwmBackend::kPigpio) {
+    return SetServoPulsePigpio(pin, pulse_us, error);
+  }
+  if (pwm_backend == PwmBackend::kSysfsSoft) {
+    if (soft_pwm == nullptr) {
+      *error = "soft PWM manager unavailable";
+      return false;
+    }
+    return soft_pwm->SetPulseUs(pin, pulse_us, error);
+  }
+
+  std::string pigpio_error;
+  if (SetServoPulsePigpio(pin, pulse_us, &pigpio_error)) {
+    return true;
+  }
+
+  if (soft_pwm != nullptr) {
+    std::string soft_pwm_error;
+    if (soft_pwm->SetPulseUs(pin, pulse_us, &soft_pwm_error)) {
+      return true;
+    }
+    *error = "pigpio failed: " + pigpio_error + "; sysfs_soft failed: " + soft_pwm_error;
+    return false;
+  }
+
+  *error = "pigpio failed: " + pigpio_error;
+  return false;
 }
 
 bool IsSupportedEndpointKind(const std::string& kind) {
@@ -305,7 +548,9 @@ std::string BuildEndpointRegistryJson(const EndpointRegistry& endpoint_registry)
 
 CommandExecutionResult ExecuteCommand(const cstp::CommandRequestPayload& request,
                                       const std::string& local_device_id, GpioMode gpio_mode,
-                                      int default_led_pin, EndpointRegistry* endpoint_registry) {
+                                      PwmBackend pwm_backend, int default_led_pin,
+                                      EndpointRegistry* endpoint_registry,
+                                      SoftPwmManager* soft_pwm) {
   CommandExecutionResult out;
 
   if (!request.target_device_id.empty() && request.target_device_id != local_device_id) {
@@ -442,7 +687,7 @@ CommandExecutionResult ExecuteCommand(const cstp::CommandRequestPayload& request
       }
       std::string error;
       if (!ApplyPwmOutput(endpoint.pin, *pulse_arg, endpoint.min_pulse_us, endpoint.max_pulse_us,
-                          gpio_mode, &error)) {
+                          gpio_mode, pwm_backend, soft_pwm, &error)) {
         out.status_code = 500;
         out.message = "pwm_write_failed: " + error;
         return out;
@@ -500,7 +745,8 @@ CommandExecutionResult ExecuteCommand(const cstp::CommandRequestPayload& request
     }
 
     std::string error;
-    if (!ApplyPwmOutput(*pin_arg, *pulse_arg, 500, 2500, gpio_mode, &error)) {
+    if (!ApplyPwmOutput(*pin_arg, *pulse_arg, 500, 2500, gpio_mode, pwm_backend, soft_pwm,
+                        &error)) {
       out.status_code = 500;
       out.message = "pwm_write_failed: " + error;
       return out;
@@ -524,7 +770,8 @@ void LogFrameSummary(const cstp::Frame& frame) {
 }
 
 void HandleClient(int client_fd, GpioMode gpio_mode, int default_led_pin,
-                  EndpointRegistry* endpoint_registry) {
+                  PwmBackend pwm_backend, EndpointRegistry* endpoint_registry,
+                  SoftPwmManager* soft_pwm) {
   const cstp::Frame hello_frame = cstp::ReceiveFrame(client_fd);
   if (hello_frame.header.type != cstp::MessageType::kHello) {
     throw cstp::ProtocolError("expected HELLO as first message");
@@ -599,8 +846,8 @@ void HandleClient(int client_fd, GpioMode gpio_mode, int default_led_pin,
                   << " command_name=" << request.command_name << "\n";
 
         const CommandExecutionResult exec =
-            ExecuteCommand(request, hello.device_id, gpio_mode, default_led_pin,
-                           endpoint_registry);
+            ExecuteCommand(request, hello.device_id, gpio_mode, pwm_backend, default_led_pin,
+                           endpoint_registry, soft_pwm);
 
         cstp::CommandResponsePayload response;
         response.command_id = request.command_id;
@@ -646,7 +893,9 @@ void HandleClient(int client_fd, GpioMode gpio_mode, int default_led_pin,
 int main(int argc, char** argv) {
   const int port = (argc > 1) ? std::atoi(argv[1]) : 18830;
   const GpioMode gpio_mode = ResolveGpioMode();
+  const PwmBackend pwm_backend = ResolvePwmBackend();
   const int default_led_pin = ResolveDefaultLedPin();
+  SoftPwmManager soft_pwm;
   EndpointRegistry endpoint_registry;
   endpoint_registry["default"] = EndpointDefinition{
       .kind = "digital_out",
@@ -690,6 +939,7 @@ int main(int argc, char** argv) {
   std::cout << "CSTP server listening on port " << port << "\n";
   std::cout << "GPIO mode=" << GpioModeName(gpio_mode)
             << " default_led_pin=" << default_led_pin << "\n";
+  std::cout << "PWM backend=" << PwmBackendName(pwm_backend) << "\n";
   std::cout << "registered endpoints: " << BuildEndpointRegistryJson(endpoint_registry) << "\n";
 
   for (;;) {
@@ -704,7 +954,8 @@ int main(int argc, char** argv) {
 
     try {
       std::cout << "client connected\n";
-      HandleClient(client_fd, gpio_mode, default_led_pin, &endpoint_registry);
+      HandleClient(client_fd, gpio_mode, default_led_pin, pwm_backend, &endpoint_registry,
+                   &soft_pwm);
     } catch (const std::exception& e) {
       if (IsClientDisconnect(e)) {
         std::cout << "client disconnected\n";

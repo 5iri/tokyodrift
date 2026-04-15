@@ -1,8 +1,12 @@
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <optional>
 #include <string>
+#include <string_view>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -32,8 +36,235 @@ class FdGuard {
   int fd_;
 };
 
+enum class GpioMode {
+  kMock,
+  kSysfs,
+};
+
+struct CommandExecutionResult {
+  std::uint16_t status_code = 500;
+  std::string message = "internal_error";
+  std::string result_json = "{}";
+};
+
 bool IsClientDisconnect(const std::exception& e) {
   return std::string(e.what()) == "peer closed socket while receiving data";
+}
+
+GpioMode ResolveGpioMode() {
+  const char* env = std::getenv("CSTP_GPIO_MODE");
+  if (env != nullptr) {
+    const std::string value(env);
+    if (value == "mock") {
+      return GpioMode::kMock;
+    }
+    if (value == "sysfs") {
+      return GpioMode::kSysfs;
+    }
+  }
+#if defined(__linux__)
+  return GpioMode::kSysfs;
+#else
+  return GpioMode::kMock;
+#endif
+}
+
+int ResolveDefaultLedPin() {
+  const char* env = std::getenv("CSTP_LED_PIN");
+  if (env == nullptr) {
+    return 17;
+  }
+  try {
+    return std::stoi(env);
+  } catch (...) {
+    return 17;
+  }
+}
+
+std::string GpioModeName(GpioMode mode) {
+  return mode == GpioMode::kSysfs ? "sysfs" : "mock";
+}
+
+std::optional<std::size_t> FindKeyStart(const std::string& json, const std::string& key) {
+  const std::string quoted = "\"" + key + "\"";
+  const std::size_t quoted_pos = json.find(quoted);
+  if (quoted_pos != std::string::npos) {
+    return quoted_pos + quoted.size();
+  }
+
+  const std::size_t bare_pos = json.find(key);
+  if (bare_pos != std::string::npos) {
+    return bare_pos + key.size();
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string> ExtractRawJsonValue(const std::string& json, const std::string& key) {
+  const auto key_end = FindKeyStart(json, key);
+  if (!key_end.has_value()) {
+    return std::nullopt;
+  }
+
+  const std::size_t colon = json.find(':', *key_end);
+  if (colon == std::string::npos) {
+    return std::nullopt;
+  }
+
+  std::size_t start = colon + 1;
+  while (start < json.size() && std::isspace(static_cast<unsigned char>(json[start]))) {
+    ++start;
+  }
+  if (start >= json.size()) {
+    return std::nullopt;
+  }
+
+  std::size_t end = start;
+  if (json[start] == '"') {
+    ++start;
+    end = start;
+    while (end < json.size() && json[end] != '"') {
+      ++end;
+    }
+    if (end >= json.size()) {
+      return std::nullopt;
+    }
+    return json.substr(start, end - start);
+  }
+
+  while (end < json.size() && json[end] != ',' && json[end] != '}' &&
+         !std::isspace(static_cast<unsigned char>(json[end]))) {
+    ++end;
+  }
+  return json.substr(start, end - start);
+}
+
+std::optional<int> ExtractIntArg(const std::string& json, const std::string& key) {
+  const auto raw = ExtractRawJsonValue(json, key);
+  if (!raw.has_value()) {
+    return std::nullopt;
+  }
+  try {
+    return std::stoi(*raw);
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+std::optional<bool> ExtractBoolArg(const std::string& json, const std::string& key) {
+  const auto raw = ExtractRawJsonValue(json, key);
+  if (!raw.has_value()) {
+    return std::nullopt;
+  }
+
+  std::string token;
+  token.reserve(raw->size());
+  for (char ch : *raw) {
+    token.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+  }
+
+  if (token == "1" || token == "true" || token == "on") {
+    return true;
+  }
+  if (token == "0" || token == "false" || token == "off") {
+    return false;
+  }
+  return std::nullopt;
+}
+
+bool WriteFile(const std::string& path, std::string_view content, std::string* error) {
+  std::ofstream out(path);
+  if (!out) {
+    *error = "open failed: " + path;
+    return false;
+  }
+  out << content;
+  if (!out.good()) {
+    *error = "write failed: " + path;
+    return false;
+  }
+  return true;
+}
+
+bool ExistsFile(const std::string& path) {
+  std::ifstream in(path);
+  return in.good();
+}
+
+bool SetLedSysfs(int pin, bool value, std::string* error) {
+  if (pin < 0) {
+    *error = "invalid pin";
+    return false;
+  }
+
+  const std::string gpio_base = "/sys/class/gpio/gpio" + std::to_string(pin);
+  const std::string value_path = gpio_base + "/value";
+  const std::string direction_path = gpio_base + "/direction";
+
+  if (!ExistsFile(value_path)) {
+    if (!WriteFile("/sys/class/gpio/export", std::to_string(pin), error) && !ExistsFile(value_path)) {
+      return false;
+    }
+  }
+
+  if (!WriteFile(direction_path, "out", error)) {
+    return false;
+  }
+  if (!WriteFile(value_path, value ? "1" : "0", error)) {
+    return false;
+  }
+  return true;
+}
+
+CommandExecutionResult ExecuteCommand(const cstp::CommandRequestPayload& request,
+                                      const std::string& local_device_id, GpioMode gpio_mode,
+                                      int default_led_pin) {
+  CommandExecutionResult out;
+
+  if (!request.target_device_id.empty() && request.target_device_id != local_device_id) {
+    out.status_code = 404;
+    out.message = "target_device_id does not match this receiver";
+    return out;
+  }
+
+  const std::optional<int> pin_arg = ExtractIntArg(request.args_json, "pin");
+  const int pin = pin_arg.has_value() ? *pin_arg : default_led_pin;
+
+  bool led_value = false;
+  if (request.command_name == "led_on") {
+    led_value = true;
+  } else if (request.command_name == "led_off") {
+    led_value = false;
+  } else if (request.command_name == "led_set") {
+    const auto value_arg = ExtractBoolArg(request.args_json, "value");
+    if (!value_arg.has_value()) {
+      out.status_code = 400;
+      out.message = "led_set requires args_json.value (true/false/1/0)";
+      return out;
+    }
+    led_value = *value_arg;
+  } else {
+    out.status_code = 400;
+    out.message = "unsupported command_name";
+    return out;
+  }
+
+  if (gpio_mode == GpioMode::kMock) {
+    std::cout << "MOCK GPIO pin=" << pin << " value=" << (led_value ? 1 : 0) << "\n";
+  } else {
+    std::string error;
+    if (!SetLedSysfs(pin, led_value, &error)) {
+      out.status_code = 500;
+      out.message = "gpio_write_failed: " + error;
+      return out;
+    }
+  }
+
+  out.status_code = 200;
+  out.message = "ok";
+  out.result_json = "{\"pin\":" + std::to_string(pin) + ",\"value\":" +
+                    std::to_string(led_value ? 1 : 0) + ",\"mode\":\"" +
+                    GpioModeName(gpio_mode) + "\"}";
+  return out;
 }
 
 void LogFrameSummary(const cstp::Frame& frame) {
@@ -41,7 +272,7 @@ void LogFrameSummary(const cstp::Frame& frame) {
             << frame.header.message_id << " payload_bytes=" << frame.payload.size() << "\n";
 }
 
-void HandleClient(int client_fd) {
+void HandleClient(int client_fd, GpioMode gpio_mode, int default_led_pin) {
   const cstp::Frame hello_frame = cstp::ReceiveFrame(client_fd);
   if (hello_frame.header.type != cstp::MessageType::kHello) {
     throw cstp::ProtocolError("expected HELLO as first message");
@@ -82,6 +313,25 @@ void HandleClient(int client_fd) {
         std::cout << "DATA_BATCH batch_id=" << batch.batch_id
                   << " sensors=" << batch.sensors.size()
                   << " device_id=" << batch.device_id << "\n";
+
+        cstp::DataAckPayload ack;
+        ack.acked_message_id = frame.header.message_id;
+        ack.batch_id = batch.batch_id;
+        ack.status = cstp::DataAckStatus::kAccepted;
+        ack.received_at_ms = cstp::UnixMillisNow();
+        ack.note = "accepted";
+
+        cstp::Frame ack_frame;
+        ack_frame.header.type = cstp::MessageType::kDataAck;
+        ack_frame.header.flags = cstp::FrameFlags::kIsAck;
+        ack_frame.header.message_id = frame.header.message_id;
+        ack_frame.header.stream_id = cstp::StreamId::kData;
+        ack_frame.header.timestamp_ms = cstp::UnixMillisNow();
+        ack_frame.payload = cstp::EncodeDataAckPayload(ack);
+        cstp::SendFrame(client_fd, ack_frame);
+
+        std::cout << "DATA_ACK sent for msg_id=" << frame.header.message_id
+                  << " batch_id=" << batch.batch_id << "\n";
         break;
       }
       case cstp::MessageType::kHeartbeat: {
@@ -89,6 +339,33 @@ void HandleClient(int client_fd) {
         std::cout << "HEARTBEAT uptime_ms=" << heartbeat.uptime_ms
                   << " pending_batches=" << heartbeat.pending_batches
                   << " last_batch_id=" << heartbeat.last_batch_id << "\n";
+        break;
+      }
+      case cstp::MessageType::kCmdReq: {
+        const cstp::CommandRequestPayload request = cstp::DecodeCommandRequestPayload(frame.payload);
+        std::cout << "CMD_REQ command_id=" << request.command_id
+                  << " command_name=" << request.command_name << "\n";
+
+        const CommandExecutionResult exec =
+            ExecuteCommand(request, hello.device_id, gpio_mode, default_led_pin);
+
+        cstp::CommandResponsePayload response;
+        response.command_id = request.command_id;
+        response.status_code = exec.status_code;
+        response.message = exec.message;
+        response.result_json = exec.result_json;
+
+        cstp::Frame response_frame;
+        response_frame.header.type = cstp::MessageType::kCmdResp;
+        response_frame.header.flags = cstp::FrameFlags::kIsAck;
+        response_frame.header.message_id = frame.header.message_id;
+        response_frame.header.stream_id = cstp::StreamId::kControl;
+        response_frame.header.timestamp_ms = cstp::UnixMillisNow();
+        response_frame.payload = cstp::EncodeCommandResponsePayload(response);
+        cstp::SendFrame(client_fd, response_frame);
+
+        std::cout << "CMD_RESP sent command_id=" << response.command_id
+                  << " status_code=" << response.status_code << "\n";
         break;
       }
       case cstp::MessageType::kCmdResp: {
@@ -115,6 +392,8 @@ void HandleClient(int client_fd) {
 
 int main(int argc, char** argv) {
   const int port = (argc > 1) ? std::atoi(argv[1]) : 18830;
+  const GpioMode gpio_mode = ResolveGpioMode();
+  const int default_led_pin = ResolveDefaultLedPin();
 
   int server_fd = socket(AF_INET, SOCK_STREAM, 0);
   if (server_fd < 0) {
@@ -141,6 +420,8 @@ int main(int argc, char** argv) {
   }
 
   std::cout << "CSTP server listening on port " << port << "\n";
+  std::cout << "GPIO mode=" << GpioModeName(gpio_mode)
+            << " default_led_pin=" << default_led_pin << "\n";
 
   for (;;) {
     sockaddr_in client_addr{};
@@ -154,7 +435,7 @@ int main(int argc, char** argv) {
 
     try {
       std::cout << "client connected\n";
-      HandleClient(client_fd);
+      HandleClient(client_fd, gpio_mode, default_led_pin);
     } catch (const std::exception& e) {
       if (IsClientDisconnect(e)) {
         std::cout << "client disconnected\n";

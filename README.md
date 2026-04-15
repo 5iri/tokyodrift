@@ -26,7 +26,7 @@ ctest --test-dir build --output-on-failure
 Terminal 1:
 
 ```bash
-./build/cstp_server 18830
+CSTP_GPIO_MODE=mock ./build/cstp_server 18830
 ```
 
 Terminal 2:
@@ -35,7 +35,34 @@ Terminal 2:
 ./build/cstp_client 127.0.0.1 18830
 ```
 
-The client sends `HELLO`, server replies `HELLO_ACK`.
+The client sends `HELLO`, receives `HELLO_ACK`, then sends one sample `DATA_BATCH` and expects `DATA_ACK`.
+
+## Remote LED Command (RPi)
+
+Server supports `CMD_REQ` with command names:
+
+- `led_on`
+- `led_off`
+- `led_set` (requires value)
+
+Start receiver on Pi (real GPIO via sysfs):
+
+```bash
+CSTP_GPIO_MODE=sysfs CSTP_LED_PIN=17 ./build/cstp_server 18830
+```
+
+From remote client, send command:
+
+```bash
+./build/cstp_client <rpi-ip> 18830 led_on 17
+./build/cstp_client <rpi-ip> 18830 led_off 17
+./build/cstp_client <rpi-ip> 18830 led_set 17 1
+./build/cstp_client <rpi-ip> 18830 led_set 17 0
+```
+
+When a command is provided, the client sends `HELLO` then `CMD_REQ` directly.
+
+Command response is printed as `CMD_RESP` with status code and result JSON.
 
 ## Layout
 

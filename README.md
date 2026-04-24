@@ -9,6 +9,10 @@ C++20 starter implementation for a custom MQTT-like protocol focused on:
 
 Protocol spec: `docs/protocol-v0.md`
 
+## Demo Screenshot
+
+![CSTP terminal demo showing handshake, subscribe, publish, and acknowledgements](assets/result.jpg)
+
 ## Build
 
 ```bash
